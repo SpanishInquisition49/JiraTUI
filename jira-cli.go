@@ -9,7 +9,9 @@ import (
 
 	jira "github.com/andygrunwald/go-jira"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/joho/godotenv"
@@ -20,29 +22,37 @@ type Styles struct {
 	FocuedBorderColor lipgloss.Color
 	inputField        lipgloss.Style
 	issueList         lipgloss.Style
+	detailCard        lipgloss.Style
 }
 
 func DefaultStyles() *Styles {
+	// Base baseStyle for the components
+	baseStyle := lipgloss.NewStyle().
+		Padding(1).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("12"))
+
 	s := new(Styles)
 	s.BorderColor = lipgloss.Color("12")
 	s.FocuedBorderColor = lipgloss.Color("11")
-	s.inputField = lipgloss.NewStyle().
-		BorderForeground(s.BorderColor).
-		BorderStyle(lipgloss.RoundedBorder()).Padding(1).Width(80)
-	s.issueList = s.inputField
+	s.inputField = baseStyle
+	s.issueList = baseStyle.BorderForeground(s.FocuedBorderColor)
+	s.detailCard = baseStyle
 	return s
 }
 
 type model struct {
-	width         int
-	height        int
-	jqlField      textinput.Model
-	jiraClient    *jira.Client
-	styles        *Styles
-	status        status
-	issuesList    list.Model
-	issues        []jira.Issue
-	selectedIssue *jira.Issue
+	width               int
+	height              int
+	jqlField            textinput.Model
+	jiraClient          *jira.Client
+	styles              *Styles
+	status              status
+	issuesList          list.Model
+	issues              []jira.Issue
+	selectedIssue       *jira.Issue
+	descriptionViewport viewport.Model
+	isStacked           bool
 }
 
 type item string
@@ -93,6 +103,11 @@ func New(jiraClient *jira.Client) *model {
 	styles := DefaultStyles()
 	jqlField := textinput.New()
 	jqlField.Placeholder = "Enter JQL"
+	// Read from the .env the default JQL query if any
+	jql := os.Getenv("JIRA_DEFAULT_JQL")
+	if jql != "" {
+		jqlField.SetValue(jql)
+	}
 
 	// Initialize the issue list component
 	// The list will be initially empty
@@ -103,41 +118,60 @@ func New(jiraClient *jira.Client) *model {
 		15,
 		20,
 	)
+
+	// Create the list spinner
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+
 	issuesList.Title = "Issues"
 	issuesList.Styles.Title = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	issuesList.SetFilteringEnabled(false)
 	issuesList.SetShowStatusBar(false)
+	issuesList.SetSpinner(sp.Spinner)
+
+	descriptionViewport := viewport.New(0, 0)
 
 	return &model{
-		jiraClient:    jiraClient,
-		jqlField:      jqlField,
-		styles:        styles,
-		status:        StatusDefault,
-		issuesList:    issuesList,
-		issues:        []jira.Issue{},
-		selectedIssue: nil,
+		jiraClient:          jiraClient,
+		jqlField:            jqlField,
+		styles:              styles,
+		status:              StatusDefault,
+		issuesList:          issuesList,
+		issues:              []jira.Issue{},
+		selectedIssue:       nil,
+		descriptionViewport: descriptionViewport,
+		isStacked:           false,
 	}
 }
 
 func (m model) Init() tea.Cmd {
+	if m.jqlField.Value() != "" {
+		return tea.Batch(m.issuesList.StartSpinner(), searchIssues(m, m.jqlField.Value()))
+	}
 	return nil
 }
 
-func ToggleSearch(model *model) {
-	if model.status == StatusSearch {
-		model.status = StatusDefault
-		model.styles.inputField = model.styles.inputField.BorderForeground(model.styles.BorderColor)
-		model.jqlField.Blur()
+func ToggleSearch(m *model) {
+	if m.status == StatusSearch {
+		m.status = StatusDefault
+		m.styles.inputField = m.styles.inputField.BorderForeground(m.styles.BorderColor)
+		m.styles.issueList = m.styles.issueList.BorderForeground(m.styles.FocuedBorderColor)
+		m.jqlField.Blur()
 	} else {
-		model.status = StatusSearch
-		model.styles.inputField = model.styles.inputField.BorderForeground(model.styles.FocuedBorderColor)
-		model.jqlField.Focus()
+		m.status = StatusSearch
+		m.styles.inputField = m.styles.inputField.BorderForeground(m.styles.FocuedBorderColor)
+		m.styles.issueList = m.styles.issueList.BorderForeground(m.styles.BorderColor)
+		m.jqlField.Focus()
 	}
 }
 
 func Resize(m *model) {
+  
+	// Decide layout: side-by-side or stacked
+	m.isStacked = m.width <= 80
 	// Set responsive dimensions for the input field
-	m.jqlField.Width = m.width - 4 // Leave padding for borders
+	m.jqlField.Width = m.width - 7 // Leave padding for borders
 
 	// Adjust the issue list and issue card dynamically
 	availableHeight := m.height - 4 // Account for input field and padding
@@ -155,12 +189,11 @@ func Resize(m *model) {
 	m.styles.issueList.Width(listWidth) // Adjust issue list style width
 }
 
-func IssueCard(issue *jira.Issue) string {
+func IssueCard(issue *jira.Issue, m model) string {
 	// Styles for different parts of the card
 	titleStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("9")).
-		Bold(true).
-		Padding(0, 1)
+		Bold(true)
 
 	fieldLabelStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("6")).
@@ -169,17 +202,23 @@ func IssueCard(issue *jira.Issue) string {
 	fieldValueStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("8"))
 
+  remainingWidth := m.width - lipgloss.Width(m.issuesList.View()) - 6
+  if m.isStacked {
+    remainingWidth = m.width - 6
+  }
+
 	cardStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("12")).
 		Padding(1, 2).
-		Width(50)
+    Width(remainingWidth)
 
 	// Extract issue details
 	summary := "No Summary"
 	status := "Unknown"
 	assignee := "Unassigned"
 	reporter := "Unknown Reporter"
+	description := "No Description"
 
 	if issue != nil {
 		if issue.Fields.Summary != "" {
@@ -194,14 +233,22 @@ func IssueCard(issue *jira.Issue) string {
 		if issue.Fields.Reporter != nil && issue.Fields.Reporter.DisplayName != "" {
 			reporter = issue.Fields.Reporter.DisplayName
 		}
+		if issue.Fields.Description != "" {
+			description = issue.Fields.Description
+		}
 	}
 
+	// use the viewport to render the description
+	m.descriptionViewport.SetContent(description)
+	m.descriptionViewport.Width = m.width - m.issuesList.Width()
 	// Create the card content
-	cardContent := lipgloss.JoinVertical(lipgloss.Left,
+	cardContent := lipgloss.JoinVertical(
+		lipgloss.Left,
 		titleStyle.Render(summary),
 		fmt.Sprintf("%s %s", fieldLabelStyle.Render("Status:"), fieldValueStyle.Render(status)),
 		fmt.Sprintf("%s %s", fieldLabelStyle.Render("Assignee:"), fieldValueStyle.Render(assignee)),
 		fmt.Sprintf("%s %s", fieldLabelStyle.Render("Reporter:"), fieldValueStyle.Render(reporter)),
+		m.descriptionViewport.View(),
 	)
 
 	// Apply card styling
@@ -210,6 +257,7 @@ func IssueCard(issue *jira.Issue) string {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
+	commands := []tea.Cmd{}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
@@ -224,6 +272,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			items = append(items, item(issue.Key))
 		}
 		m.issuesList.SetItems(items)
+		m.issuesList.StopSpinner()
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -235,9 +284,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "enter":
 			if m.status == StatusSearch {
-				cmd = searchIssues(m, m.jqlField.Value())
+				commands = append(commands, searchIssues(m, m.jqlField.Value()))
 				ToggleSearch(&m)
-				return m, cmd
+				commands = append(commands, m.issuesList.StartSpinner())
+				return m, tea.Batch(commands...)
 			}
 		case "/":
 			ToggleSearch(&m)
@@ -246,12 +296,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Update the models
-	if m.status == StatusSearch {
-		m.jqlField, cmd = m.jqlField.Update(msg)
-	} else {
-		m.issuesList, cmd = m.issuesList.Update(msg)
-	}
+	m.jqlField, cmd = m.jqlField.Update(msg)
+	commands = append(commands, cmd)
+	m.issuesList, cmd = m.issuesList.Update(msg)
+	commands = append(commands, cmd)
 	selectedIssueIndex := m.issuesList.Index()
+	m.descriptionViewport, cmd = m.descriptionViewport.Update(msg)
+	commands = append(commands, cmd)
 	log.Printf("Selected Issue Index: %d\n", selectedIssueIndex)
 	if selectedIssueIndex >= 0 && selectedIssueIndex < len(m.issues) {
 		m.selectedIssue = &m.issues[selectedIssueIndex]
@@ -259,7 +310,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	} else {
 		m.selectedIssue = nil
 	}
-	return m, cmd
+	return m, tea.Batch(commands...)
 }
 
 func (m model) View() string {
@@ -267,24 +318,22 @@ func (m model) View() string {
 		return "Initializing..."
 	}
 
-	// Decide layout: side-by-side or stacked
-	isWide := m.width > 80
 	var content string
 
-	if isWide {
+	if m.isStacked {
+		// Stacked layout
+		content = lipgloss.JoinVertical(
+			lipgloss.Top,
+			m.styles.issueList.Render(m.issuesList.View()),
+			IssueCard(m.selectedIssue, m),
+		)
+	} else {
 		// Side-by-side layout with more space for issue card
 		content = lipgloss.JoinHorizontal(
 			lipgloss.Left,
 			m.styles.issueList.Render(m.issuesList.View()),
 			lipgloss.NewStyle().Width(m.width-m.issuesList.Width()).
-				Render(IssueCard(m.selectedIssue)), // Adjust the width dynamically
-		)
-	} else {
-		// Stacked layout
-		content = lipgloss.JoinVertical(
-			lipgloss.Top,
-			m.styles.issueList.Render(m.issuesList.View()),
-			IssueCard(m.selectedIssue),
+				Render(IssueCard(m.selectedIssue, m)), // Adjust the width dynamically
 		)
 	}
 
