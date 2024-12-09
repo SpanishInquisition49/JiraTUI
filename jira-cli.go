@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/joho/godotenv"
 )
@@ -37,7 +38,10 @@ func DefaultStyles() *Styles {
 	s.FocuedBorderColor = lipgloss.Color("11")
 	s.inputField = baseStyle
 	s.issueList = baseStyle.BorderForeground(s.FocuedBorderColor)
-	s.detailCard = baseStyle
+	s.detailCard = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(s.BorderColor).
+		Padding(1, 2)
 	return s
 }
 
@@ -97,6 +101,8 @@ type (
 const (
 	StatusDefault status = iota
 	StatusSearch
+	StatusIssueDetail
+	StatusComment
 )
 
 func New(jiraClient *jira.Client) *model {
@@ -152,22 +158,26 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
-func ToggleSearch(m *model) {
-	if m.status == StatusSearch {
-		m.status = StatusDefault
-		m.styles.inputField = m.styles.inputField.BorderForeground(m.styles.BorderColor)
-		m.styles.issueList = m.styles.issueList.BorderForeground(m.styles.FocuedBorderColor)
-		m.jqlField.Blur()
-	} else {
-		m.status = StatusSearch
+// TODO: Change the function in order to support multiple state transitions
+func ChangeStatus(m *model, newStatus status) {
+	// Reset the styles
+	m.styles.inputField = m.styles.inputField.BorderForeground(m.styles.BorderColor)
+	m.styles.issueList = m.styles.issueList.BorderForeground(m.styles.BorderColor)
+	m.styles.detailCard = m.styles.detailCard.BorderForeground(m.styles.BorderColor)
+	m.jqlField.Blur()
+	switch newStatus {
+	case StatusSearch:
 		m.styles.inputField = m.styles.inputField.BorderForeground(m.styles.FocuedBorderColor)
-		m.styles.issueList = m.styles.issueList.BorderForeground(m.styles.BorderColor)
 		m.jqlField.Focus()
+	case StatusDefault:
+		m.styles.issueList = m.styles.issueList.BorderForeground(m.styles.FocuedBorderColor)
+	case StatusIssueDetail:
+		m.styles.detailCard = m.styles.detailCard.BorderForeground(m.styles.FocuedBorderColor)
 	}
+	m.status = newStatus
 }
 
 func Resize(m *model) {
-  
 	// Decide layout: side-by-side or stacked
 	m.isStacked = m.width <= 80
 	// Set responsive dimensions for the input field
@@ -202,16 +212,15 @@ func IssueCard(issue *jira.Issue, m model) string {
 	fieldValueStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("8"))
 
-  remainingWidth := m.width - lipgloss.Width(m.issuesList.View()) - 6
-  if m.isStacked {
-    remainingWidth = m.width - 6
-  }
+	issueListWidth, issueListHeight := lipgloss.Size(m.issuesList.View())
+	remainingWidth := m.width - issueListWidth - 6
+	if m.isStacked {
+		remainingWidth = m.width - 6
+	}
 
-	cardStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("12")).
-		Padding(1, 2).
-    Width(remainingWidth)
+	cardStyle := m.styles.detailCard
+	cardStyle = cardStyle.Width(remainingWidth)
+	cardStyle = cardStyle.Height(m.height - issueListHeight - 4)
 
 	// Extract issue details
 	summary := "No Summary"
@@ -237,10 +246,15 @@ func IssueCard(issue *jira.Issue, m model) string {
 			description = issue.Fields.Description
 		}
 	}
-
+	r, _ := glamour.NewTermRenderer(
+		glamour.WithStandardStyle("dark"),
+    glamour.WithWordWrap(remainingWidth-8),
+	)
+  description, _ = r.Render(description)
 	// use the viewport to render the description
 	m.descriptionViewport.SetContent(description)
 	m.descriptionViewport.Width = m.width - m.issuesList.Width()
+	m.descriptionViewport.Height = m.height - issueListHeight - 4
 	// Create the card content
 	cardContent := lipgloss.JoinVertical(
 		lipgloss.Left,
@@ -248,6 +262,7 @@ func IssueCard(issue *jira.Issue, m model) string {
 		fmt.Sprintf("%s %s", fieldLabelStyle.Render("Status:"), fieldValueStyle.Render(status)),
 		fmt.Sprintf("%s %s", fieldLabelStyle.Render("Assignee:"), fieldValueStyle.Render(assignee)),
 		fmt.Sprintf("%s %s", fieldLabelStyle.Render("Reporter:"), fieldValueStyle.Render(reporter)),
+		fmt.Sprintf("%s", fieldLabelStyle.Render("Description:")),
 		m.descriptionViewport.View(),
 	)
 
@@ -258,6 +273,25 @@ func IssueCard(issue *jira.Issue, m model) string {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	commands := []tea.Cmd{}
+	// Update the models
+	m.jqlField, cmd = m.jqlField.Update(msg)
+	commands = append(commands, cmd)
+	if m.status != StatusIssueDetail {
+		m.issuesList, cmd = m.issuesList.Update(msg)
+		commands = append(commands, cmd)
+	}
+	selectedIssueIndex := m.issuesList.Index()
+	if m.status == StatusIssueDetail {
+		m.descriptionViewport, cmd = m.descriptionViewport.Update(msg)
+		commands = append(commands, cmd)
+	}
+	log.Printf("Selected Issue Index: %d\n", selectedIssueIndex)
+	if selectedIssueIndex >= 0 && selectedIssueIndex < len(m.issues) {
+		m.selectedIssue = &m.issues[selectedIssueIndex]
+		log.Printf("Selected Issue: %s\n", m.selectedIssue.Key)
+	} else {
+		m.selectedIssue = nil
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
@@ -283,33 +317,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl-c":
 			return m, tea.Quit
 		case "enter":
-			if m.status == StatusSearch {
+			switch m.status {
+			case StatusSearch:
+				// Run the search command and start the spinner
 				commands = append(commands, searchIssues(m, m.jqlField.Value()))
-				ToggleSearch(&m)
+				ChangeStatus(&m, StatusDefault)
 				commands = append(commands, m.issuesList.StartSpinner())
 				return m, tea.Batch(commands...)
+			case StatusDefault:
+				ChangeStatus(&m, StatusIssueDetail)
+			case StatusIssueDetail:
+				ChangeStatus(&m, StatusDefault)
 			}
 		case "/":
-			ToggleSearch(&m)
+			ChangeStatus(&m, StatusSearch)
 			return m, nil
 		}
 	}
 
-	// Update the models
-	m.jqlField, cmd = m.jqlField.Update(msg)
-	commands = append(commands, cmd)
-	m.issuesList, cmd = m.issuesList.Update(msg)
-	commands = append(commands, cmd)
-	selectedIssueIndex := m.issuesList.Index()
-	m.descriptionViewport, cmd = m.descriptionViewport.Update(msg)
-	commands = append(commands, cmd)
-	log.Printf("Selected Issue Index: %d\n", selectedIssueIndex)
-	if selectedIssueIndex >= 0 && selectedIssueIndex < len(m.issues) {
-		m.selectedIssue = &m.issues[selectedIssueIndex]
-		log.Printf("Selected Issue: %s\n", m.selectedIssue.Key)
-	} else {
-		m.selectedIssue = nil
-	}
 	return m, tea.Batch(commands...)
 }
 
