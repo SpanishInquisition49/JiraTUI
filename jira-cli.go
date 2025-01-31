@@ -7,9 +7,11 @@ import (
 	"os"
 	"strings"
 
-	jira "github.com/andygrunwald/go-jira"
+  // External packages
+  "github.com/andygrunwald/go-jira"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -49,6 +51,7 @@ type model struct {
 	width               int
 	height              int
 	jqlField            textinput.Model
+	commentBox          textarea.Model
 	jiraClient          *jira.Client
 	styles              *Styles
 	status              status
@@ -124,6 +127,13 @@ func New(jiraClient *jira.Client) *model {
 		15,
 		20,
 	)
+
+	// commenrBox Initialization
+	commentBox := textarea.New()
+	commentBox.Placeholder = "Write your comment here..."
+	commentBox.SetWidth(50)  // Larghezza della textarea
+	commentBox.SetHeight(10) // Altezza della textarea
+	commentBox.ShowLineNumbers = false
 
 	// Create the list spinner
 	sp := spinner.New()
@@ -248,9 +258,9 @@ func IssueCard(issue *jira.Issue, m model) string {
 	}
 	r, _ := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
-    glamour.WithWordWrap(remainingWidth-8),
+		glamour.WithWordWrap(remainingWidth-8),
 	)
-  description, _ = r.Render(description)
+	description, _ = r.Render(description)
 	// use the viewport to render the description
 	m.descriptionViewport.SetContent(description)
 	m.descriptionViewport.Width = m.width - m.issuesList.Width()
@@ -314,10 +324,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.status != StatusSearch {
 				return m, tea.Quit
 			}
+		case "m":
+			if m.status == StatusIssueDetail {
+				ChangeStatus(&m, StatusComment)
+				m.commentBox.Focus()
+			}
 		case "ctrl-c":
 			return m, tea.Quit
 		case "enter":
 			switch m.status {
+			case StatusComment:
+				if m.commentBox.Value() != "" {
+					// Send the comment
+					comment := m.commentBox.Value()
+					commands = append(commands, addComment(m, *m.selectedIssue, comment))
+					m.commentBox.Reset()
+					ChangeStatus(&m, StatusIssueDetail)
+				}
 			case StatusSearch:
 				// Run the search command and start the spinner
 				commands = append(commands, searchIssues(m, m.jqlField.Value()))
@@ -328,6 +351,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				ChangeStatus(&m, StatusIssueDetail)
 			case StatusIssueDetail:
 				ChangeStatus(&m, StatusDefault)
+			}
+		case "esc":
+			if m.status == StatusComment {
+				ChangeStatus(&m, StatusIssueDetail)
+				return m, nil
 			}
 		case "/":
 			ChangeStatus(&m, StatusSearch)
@@ -341,6 +369,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return "Initializing..."
+	}
+
+	if m.status == StatusComment {
+		// Mostra solo la textarea per i commenti
+		return lipgloss.JoinVertical(
+			lipgloss.Top,
+			m.styles.inputField.Render(m.jqlField.View()),
+			m.styles.detailCard.Render(IssueCard(m.selectedIssue, m)),
+			m.commentBox.View(), // Popup con la textarea
+		)
 	}
 
 	var content string
@@ -392,6 +430,8 @@ func main() {
 		log.Fatal(err)
 	}
 
+
+
 	m := New(jiraClient)
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -407,5 +447,17 @@ func searchIssues(m model, jql string) tea.Cmd {
 			return err
 		}
 		return issuesMsg{issues: issues}
+	}
+}
+
+func addComment(m model, issue jira.Issue, comment string) tea.Cmd {
+	return func() tea.Msg {
+		_, _, err := m.jiraClient.Issue.AddComment(issue.ID, &jira.Comment{
+			Body: comment,
+		})
+		if err != nil {
+			return errorMsg{err}
+		}
+		return nil
 	}
 }
