@@ -1,6 +1,6 @@
 module github.com/SpanishInquisition49/JiraTUI
 
-go 1.23.3
+go 1.22.2
 
 require (
 	github.com/andygrunwald/go-jira v1.16.0
@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.2.4
 	github.com/charmbracelet/glamour v0.8.0
 	github.com/charmbracelet/lipgloss v1.0.0
+	github.com/google/go-cmp v0.5.8
 	github.com/joho/godotenv v1.5.1
 )
 
